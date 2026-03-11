@@ -1,0 +1,44 @@
+{
+  "name": "sql-rely",
+  "displayName": "SQL Rely",
+  "description": "A database testing extension for VS Code using native UI",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Testing"
+  ],
+  "extensionDependencies": [
+    "ms-mssql.mssql"
+  ],
+  "activationEvents": [
+    "onLanguage:sql",
+    "workspaceContains:*.sql"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "sql-rely.runTests",
+        "title": "SQL Rely: Run All Tests",
+        "category": "Test"
+      },
+      {
+        "command": "sql-rely.discoverTests",
+        "title": "SQL Rely: Discover Tests Manually",
+        "category": "Test"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.0.0"
+  }
+}
