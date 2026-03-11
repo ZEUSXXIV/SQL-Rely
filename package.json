@@ -25,11 +25,39 @@
         "category": "Test"
       },
       {
+        "command": "sql-rely.installSqlCop",
+        "title": "SQL Rely: Install SQLCop Tests",
+        "category": "Test"
+      },
+      {
+        "command": "sql-rely.createTest",
+        "title": "SQL Rely: Create New Test",
+        "category": "Test"
+      },
+      {
+        "command": "sql-rely.installTsqlt",
+        "title": "SQL Rely: Install tSQLt Framework",
+        "category": "Test"
+      },
+      {
+        "command": "sql-rely.editTest",
+        "title": "Edit Test"
+      },
+      {
         "command": "sql-rely.discoverTests",
         "title": "SQL Rely: Discover Tests Manually",
         "category": "Test"
       }
-    ]
+    ],
+    "menus": {
+      "testing/item/context": [
+        {
+          "command": "sql-rely.editTest",
+          "when": "testId =~ /\\./",
+          "group": "inline"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

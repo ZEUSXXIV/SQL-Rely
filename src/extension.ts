@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import { IExtension } from './mssql';
+import * as fs from 'fs';
+import * as path from 'path';
 
 let outputChannel: vscode.OutputChannel;
 
@@ -48,8 +50,358 @@ export async function activate(context: vscode.ExtensionContext) {
         await discoverTests(ctrl, mssqlApi);
         outputChannel.show(); // Show the logs when manually triggered
     }));
+
+    context.subscriptions.push(vscode.commands.registerCommand('sql-rely.installSqlCop', async () => {
+        outputChannel.appendLine('Manually triggered install SQLCop...');
+        await installSqlCopTests(mssqlApi, context);
+        outputChannel.show();
+    }));
+
+    context.subscriptions.push(vscode.commands.registerCommand('sql-rely.createTest', async () => {
+        outputChannel.appendLine('Manually triggered create Test...');
+        await createNewTest();
+    }));
+
+    context.subscriptions.push(vscode.commands.registerCommand('sql-rely.installTsqlt', async () => {
+        outputChannel.appendLine('Manually triggered install tSQLt...');
+        await installTsqltFramework(mssqlApi, context);
+        outputChannel.show();
+    }));
+
+    context.subscriptions.push(vscode.commands.registerCommand('sql-rely.editTest', async (item: vscode.TestItem) => {
+        outputChannel.appendLine(`Manually triggered edit Test...`);
+        if (item) {
+            await editExistingTest(item, mssqlApi);
+        } else {
+            vscode.window.showErrorMessage("Please right-click a test in the Test Explorer to edit it.");
+        }
+    }));
     
     outputChannel.appendLine('Activation complete.');
+}
+
+async function installSqlCopTests(api: any, context: vscode.ExtensionContext) {
+    outputChannel.appendLine('installSqlCopTests called');
+    try {
+        if (!api || !api.connectionSharing) {
+            vscode.window.showErrorMessage('SQL Rely Error: Cannot install tests, connectionSharing API is missing.');
+            return;
+        }
+
+        let editorUri = vscode.window.activeTextEditor?.document.uri.toString();
+        if (!editorUri || !editorUri.endsWith('.sql')) {
+            const sqlDoc = vscode.workspace.textDocuments.find(d => d.languageId === 'sql');
+            if (sqlDoc) {
+                editorUri = sqlDoc.uri.toString();
+            }
+        }
+
+        if (!editorUri) {
+            vscode.window.showErrorMessage(
+                'No active SQL document found to deploy tests against.',
+                'Got It'
+            );
+            return;
+        }
+
+        // Check if SQLCop tests directory exists
+        const testsDir = path.join(context.extensionPath, 'SQLCop Tests');
+        if (!fs.existsSync(testsDir)) {
+            vscode.window.showErrorMessage(`SQLCop Tests folder not found at ${testsDir}`);
+            return;
+        }
+
+        const files = fs.readdirSync(testsDir).filter(f => f.endsWith('.sql'));
+        if (files.length === 0) {
+            vscode.window.showErrorMessage('No .sql files found in SQLCop Tests folder.');
+            return;
+        }
+
+        // Create schema first
+        const createSchemaQuery = `
+            IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'SQLCop')
+            BEGIN
+                EXEC('CREATE SCHEMA [SQLCop]');
+            END
+        `;
+        outputChannel.appendLine('Creating SQLCop schema if not exists...');
+        await api.connectionSharing.executeSimpleQuery(editorUri, createSchemaQuery);
+
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: "Installing SQLCop Tests",
+            cancellable: true
+        }, async (progress, token) => {
+            let i = 0;
+            for (const file of files) {
+                if (token.isCancellationRequested) {
+                    break;
+                }
+                const progressPercentage = (i / files.length) * 100;
+                progress.report({ increment: progressPercentage, message: `Deploying ${file}...` });
+                outputChannel.appendLine(`Deploying ${file}...`);
+
+                const fullPath = path.join(testsDir, file);
+                let content = fs.readFileSync(fullPath, 'utf8');
+                
+                // Replace ALTER PROCEDURE with CREATE OR ALTER PROCEDURE
+                // We use a regex to ensure we match it case-insensitively
+                content = content.replace(/ALTER\s+PROCEDURE/ig, 'CREATE OR ALTER PROCEDURE');
+                
+                try {
+                    await api.connectionSharing.executeSimpleQuery(editorUri, content);
+                } catch (err: any) {
+                    outputChannel.appendLine(`Error deploying ${file}: ${err.message}`);
+                }
+                i++;
+            }
+        });
+
+        vscode.window.showInformationMessage(`Successfully installed ${files.length} SQLCop tests! Run Discovery to see them.`);
+    } catch (err: any) {
+        outputChannel.appendLine(`Install failed: ${err.message || String(err)}`);
+        vscode.window.showErrorMessage("SQL Rely: Installation failed. Error: " + (err.message || String(err)));
+    }
+}
+
+async function installTsqltFramework(api: any, context: vscode.ExtensionContext) {
+    outputChannel.appendLine('installTsqltFramework called');
+    try {
+        if (!api || !api.connectionSharing) {
+            vscode.window.showErrorMessage('SQL Rely Error: Cannot install tSQLt, connectionSharing API is missing.');
+            return;
+        }
+
+        let editorUri = vscode.window.activeTextEditor?.document.uri.toString();
+        if (!editorUri || !editorUri.endsWith('.sql')) {
+            const sqlDoc = vscode.workspace.textDocuments.find(d => d.languageId === 'sql');
+            if (sqlDoc) { editorUri = sqlDoc.uri.toString(); }
+        }
+
+        if (!editorUri) {
+            vscode.window.showErrorMessage('No active SQL document found to deploy tSQLt against.', 'Got It');
+            return;
+        }
+
+        const tsqltDir = path.join(context.extensionPath, 'tSQLt');
+        if (!fs.existsSync(tsqltDir)) {
+            vscode.window.showErrorMessage(`tSQLt folder not found at ${tsqltDir}.`);
+            return;
+        }
+
+        const files = ['PrepareServer.sql', 'tSQLt.class.sql'];
+        
+        try {
+            outputChannel.appendLine('Cleaning up any previous or aborted tSQLt installation...');
+            const cleanupQuery = `
+                IF OBJECT_ID('tSQLt.Uninstall') IS NOT NULL 
+                BEGIN
+                    EXEC tSQLt.Uninstall;
+                END
+                ELSE IF EXISTS (SELECT * FROM sys.schemas WHERE name = 'tSQLt')
+                BEGIN
+                    DECLARE @sql NVARCHAR(MAX) = '';
+                    -- Drop all routines (functions, procedures)
+                    SELECT @sql += 'DROP ' + CASE type WHEN 'P' THEN 'PROCEDURE' WHEN 'V' THEN 'VIEW' ELSE 'FUNCTION' END + ' [tSQLt].[' + name + '];'
+                    FROM sys.objects WHERE schema_id = SCHEMA_ID('tSQLt') AND type IN ('P', 'V', 'FN', 'IF', 'TF');
+                    EXEC sp_executesql @sql;
+                    
+                    -- Drop all tables
+                    SET @sql = '';
+                    SELECT @sql += 'DROP TABLE [tSQLt].[' + name + '];'
+                    FROM sys.objects WHERE schema_id = SCHEMA_ID('tSQLt') AND type = 'U';
+                    EXEC sp_executesql @sql;
+                    
+                    DROP SCHEMA tSQLt;
+                END
+            `;
+            await api.connectionSharing.executeSimpleQuery(editorUri, cleanupQuery);
+        } catch (e: any) {
+            outputChannel.appendLine(`Cleanup warning (can usually be ignored): ${e.message}`);
+        }
+
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: "Installing tSQLt Framework",
+            cancellable: true
+        }, async (progress, token) => {
+            
+            for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+                const file = files[fileIdx];
+                const fullPath = path.join(tsqltDir, file);
+                
+                if (!fs.existsSync(fullPath)) {
+                    outputChannel.appendLine(`File missing: ${fullPath}`);
+                    continue;
+                }
+
+                outputChannel.appendLine(`Parsing ${file}...`);
+                let content = fs.readFileSync(fullPath, 'utf8');
+                
+                if (file === 'PrepareServer.sql') {
+                    // Replace local temporary procs with permanent ones to survive connection pooling across batches
+                    content = content.replace(/tempdb\.\.#/g, 'tSQLt_Install_');
+                    content = content.replace(/#/g, 'tSQLt_Install_');
+                    
+                    content += '\nGO\nIF OBJECT_ID(\'tSQLt_Install_Private_GetAssemblyKeyBytes\') IS NOT NULL DROP PROCEDURE tSQLt_Install_Private_GetAssemblyKeyBytes;';
+                    content += '\nGO\nIF OBJECT_ID(\'tSQLt_Install_Private_EnableCLR\') IS NOT NULL DROP PROCEDURE tSQLt_Install_Private_EnableCLR;';
+                    content += '\nGO\nIF OBJECT_ID(\'tSQLt_Install_Private_GetSQLProductMajorVersion\') IS NOT NULL DROP PROCEDURE tSQLt_Install_Private_GetSQLProductMajorVersion;';
+                    content += '\nGO\nIF OBJECT_ID(\'tSQLt_Install_RemoveAssemblyKey\') IS NOT NULL DROP PROCEDURE tSQLt_Install_RemoveAssemblyKey;';
+                    content += '\nGO\nIF OBJECT_ID(\'tSQLt_Install_InstallAssemblyKey\') IS NOT NULL DROP PROCEDURE tSQLt_Install_InstallAssemblyKey;';
+                    content += '\nGO\nIF OBJECT_ID(\'tSQLt_Install_PrepareServer\') IS NOT NULL DROP PROCEDURE tSQLt_Install_PrepareServer;\nGO\n';
+                }
+
+                // Split by "GO" on its own line
+                const batches = content.split(/^(?:GO|go)[\r\n]*$/m)
+                    .map(b => b.trim())
+                    .filter(b => b.length > 0);
+
+                outputChannel.appendLine(`Found ${batches.length} batches in ${file}. Executing...`);
+
+                let batchIdx = 0;
+                for (const batch of batches) {
+                    if (token.isCancellationRequested) break;
+                    
+                    batchIdx++;
+                    const progressPercentage = ((fileIdx * 50) + ((batchIdx / batches.length) * 50));
+                    progress.report({ increment: 0, message: `Deploying ${file} (${batchIdx}/${batches.length} batches)...` });
+                    
+                    try {
+                        await api.connectionSharing.executeSimpleQuery(editorUri, batch);
+                    } catch (err: any) {
+                        outputChannel.appendLine(`FATAL: Error deploying batch ${batchIdx} of ${file}: ${err.message}`);
+                        throw new Error(`Failed to deploy ${file} on batch ${batchIdx}. SQL Error: ${err.message}`);
+                    }
+                }
+            }
+        });
+        
+        outputChannel.appendLine('Configuring CLR External Access for tSQLt...');
+        try {
+            await api.connectionSharing.executeSimpleQuery(editorUri, 'EXEC tSQLt.EnableExternalAccess @enable = 0;');
+        } catch (err: any) {
+             outputChannel.appendLine(`Warning setting CLR Access: ${err.message}`);
+             // Don't fail the whole install, sometimes this isn't strictly necessary or errors if sa privileges are missing
+        }
+
+        vscode.window.showInformationMessage(`Successfully installed the tSQLt Framework!`);
+    } catch (err: any) {
+        outputChannel.appendLine(`Install tSQLt failed: ${err.message || String(err)}`);
+        vscode.window.showErrorMessage("SQL Rely: tSQLt Installation failed. Error: " + (err.message || String(err)));
+    }
+}
+
+async function createNewTest() {
+    const testClass = await vscode.window.showInputBox({
+        prompt: 'Enter the Test Class (Schema) name',
+        placeHolder: 'e.g., tSQLt, SQLCop, FinancialTests',
+        value: 'SQLCop'
+    });
+
+    if (!testClass) { return; } // User cancelled
+
+    const testName = await vscode.window.showInputBox({
+        prompt: 'Enter the Test Name',
+        placeHolder: 'e.g., test My New Feature'
+    });
+
+    if (!testName) { return; } // User cancelled
+
+    // Ensure test name starts with "test" for tSQLt convention
+    let finalTestName = testName.trim();
+    if (!finalTestName.toLowerCase().startsWith('test')) {
+        finalTestName = 'test ' + finalTestName;
+    }
+
+    const template = `
+-- =============================================
+-- Test Class: [${testClass}]
+-- Test Name:  [${finalTestName}]
+-- =============================================
+CREATE OR ALTER PROCEDURE [${testClass}].[${finalTestName}]
+AS
+BEGIN
+    -- Assemble
+    -- TODO: Setup fake tables and test data here
+
+    -- Act
+    -- TODO: Execute the code being tested here
+
+    -- Assert
+    -- TODO: Use tSQLt.Assert... or EXEC tSQLt.Fail 'Message' to verify results
+    EXEC tSQLt.Fail 'TODO: Implement this test.';
+END;
+GO
+`;
+
+    // Open it in a new unsaved editor
+    const document = await vscode.workspace.openTextDocument({
+        language: 'sql',
+        content: template.trim()
+    });
+    
+    await vscode.window.showTextDocument(document);
+}
+
+async function editExistingTest(test: vscode.TestItem, api: any) {
+    try {
+        if (!api || !api.connectionSharing) {
+            vscode.window.showErrorMessage('SQL Rely Error: Cannot edit tests, connectionSharing API is missing.');
+            return;
+        }
+
+        let editorUri = vscode.window.activeTextEditor?.document.uri.toString();
+        if (!editorUri || !editorUri.endsWith('.sql')) {
+            const sqlDoc = vscode.workspace.textDocuments.find(d => d.languageId === 'sql');
+            if (sqlDoc) { editorUri = sqlDoc.uri.toString(); }
+        }
+
+        if (!editorUri) {
+            vscode.window.showErrorMessage('No active SQL document found to connect to the database.', 'Got It');
+            return;
+        }
+
+        const parts = test.id.split('.');
+        if (parts.length !== 2) {
+            vscode.window.showErrorMessage(`Cannot parse schema and generic test name from ID: ${test.id}`);
+            return;
+        }
+
+        const schemaName = parts[0];
+        const objectName = parts[1];
+
+        const query = `
+            SELECT definition 
+            FROM sys.sql_modules 
+            WHERE object_id = OBJECT_ID('[${schemaName}].[${objectName}]');
+        `;
+
+        const result = await api.connectionSharing.executeSimpleQuery(editorUri, query);
+        
+        let definition = '';
+        if (result && result.rows && result.rows.length > 0) {
+            definition = result.rows[0][0].displayValue || result.rows[0][0];
+            
+            // Rewrite standard CREATE PROCEDURE to CREATE OR ALTER PROCEDURE
+            // so the user can easily deploy changes without having to manually type it.
+            // Using a case-insensitive regex to handle variations in whitespace.
+            definition = definition.replace(/CREATE\s+PROCEDURE/i, 'CREATE OR ALTER PROCEDURE');
+            definition = definition.replace(/CREATE\s+PROC/i, 'CREATE OR ALTER PROCEDURE');
+        } else {
+            vscode.window.showErrorMessage(`Could not find definition for ${test.id}`);
+            return;
+        }
+
+        const document = await vscode.workspace.openTextDocument({
+            language: 'sql',
+            content: definition
+        });
+        
+        await vscode.window.showTextDocument(document);
+
+    } catch (err: any) {
+        vscode.window.showErrorMessage(`Failed to open test for editing: ${err.message || String(err)}`);
+    }
 }
 
 async function discoverTests(ctrl: vscode.TestController, api: any) {
@@ -95,13 +447,17 @@ async function discoverTests(ctrl: vscode.TestController, api: any) {
             return;
         }
 
-        // --- PROTOTYPE MOCK DISCOVERY ---
+        // Execute a dynamic discovery query
+        // According to tSQLt conventions, test classes are schemas, and tests are procedures 
+        // starting with 'test' within that schema.
         const query = `
-            SELECT 'tSQLt' AS SchemaName, 'test_CustomersExist' AS ObjectName
-            UNION ALL
-            SELECT 'tSQLt', 'test_OrdersValid'
-            UNION ALL
-            SELECT 'FinancialTests', 'test_RevenueCalculation'
+            SELECT 
+                s.name AS SchemaName,
+                p.name AS ObjectName
+            FROM sys.procedures p
+            INNER JOIN sys.schemas s ON p.schema_id = s.schema_id
+            WHERE p.name LIKE 'test%'
+            ORDER BY s.name, p.name;
         `;
 
         outputChannel.appendLine(`Executing simple query on ${editorUri}...`);
@@ -188,29 +544,46 @@ async function runHandler(request: vscode.TestRunRequest, token: vscode.Cancella
         run.started(test);
         
         try {
-            // --- PROTOTYPE MOCK EXECUTION ---
-            // Simulates test execution duration
+            // Test ID is format "SchemaName.ObjectName"
+            const parts = test.id.split('.');
+            if (parts.length !== 2) {
+                run.failed(test, new vscode.TestMessage(`Invalid test ID format: ${test.id}`));
+                continue;
+            }
+
+            const schemaName = parts[0];
+            const objectName = parts[1];
+            
+            outputChannel.appendLine(`Executing test: [${schemaName}].[${objectName}]`);
+
             const startStr = Date.now();
             
-            // Randomly pass or fail for demonstration
-            const isFailure = Math.random() > 0.7;
-            const query = `
-                WAITFOR DELAY '00:00:01';
-                SELECT ${isFailure ? "'Failure'" : "'Success'"} as Outcome;
-            `; 
+            // Execute the stored procedure via the tSQLt.Run framework hook
+            // This is required so tSQLt sets up #TestMessage and transaction isolation
+            const query = `EXEC tSQLt.Run '[${schemaName}].[${objectName}]'`; 
             
             await api.connectionSharing.executeSimpleQuery(editorUri, query);
             
             const duration = Date.now() - startStr;
-            
-            if (isFailure) {
-                run.failed(test, new vscode.TestMessage('Expected 1 but got 0.'), duration);
-            } else {
-                run.passed(test, duration);
-            }
+            outputChannel.appendLine(`${test.id} passed in ${duration}ms`);
+            run.passed(test, duration);
 
         } catch (err: any) {
-            run.failed(test, new vscode.TestMessage(err.message || 'Test failed due to exception'));
+            outputChannel.appendLine(`Test ${test.id} threw an error: ${err.message}`);
+            
+            // tSQLt failures are typically raised as errors
+            const errorMessage = err.message || 'Test failed due to exception';
+            
+            // Extract the actual failure reason if it's formatted by tSQLt or SQLCop
+            let cleanMessage = errorMessage;
+            
+            // Remove the generic ODBC/SQLClient fluff if present to make the UI cleaner
+            const msgMatch = errorMessage.match(/\[SQL Server\](.*)/);
+            if (msgMatch && msgMatch[1]) {
+                cleanMessage = msgMatch[1].trim();
+            }
+
+            run.failed(test, new vscode.TestMessage(cleanMessage));
         }
     }
 
