@@ -52,6 +52,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "run_sql_test",
+        description: "Run a specific database SQL test by name (e.g., '[MySchema].[test_MyTest]')",
+        inputSchema: {
+          type: "object",
+          properties: {
+            testName: {
+              type: "string",
+              description: "The full name of the test to run, including schema"
+            }
+          },
+          required: ["testName"]
+        },
+      },
+      {
         name: "install_sqlcop",
         description: "Install SQLCop tests into the current database via SQL Rely",
         inputSchema: {
@@ -76,6 +90,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
       if (name === "run_sql_tests") {
         const response = await axios.post(`${getBaseUrl()}/runTests`);
+        return { content: [{ type: "text", text: response.data }] };
+      } else if (name === "run_sql_test") {
+        const { testName } = request.params.arguments as { testName: string };
+        const response = await axios.post(`${getBaseUrl()}/runTest`, { testName });
         return { content: [{ type: "text", text: response.data }] };
       } else if (name === "install_sqlcop") {
         const response = await axios.post(`${getBaseUrl()}/installSqlCop`);

@@ -84,8 +84,12 @@ export async function activate(context: vscode.ExtensionContext) {
         let body = '';
         req.on('data', chunk => { body += chunk; });
         req.on('end', async () => {
-            if (req.url === '/runTests' && req.method === 'POST') {
-                outputChannel.appendLine('MCP requested test execution. Running...');
+            const url = req.url || '';
+            const method = req.method || 'GET';
+            outputChannel.appendLine(`MCP Backend received: ${method} ${url}`);
+
+            if ((url === '/runTests' || url === '/runTests/') && method === 'POST') {
+                outputChannel.appendLine('Match: /runTests');
                 try {
                     // Find an open SQL document to serve as the connection context
                     let editorUri = vscode.window.activeTextEditor?.document.uri.toString();
@@ -266,11 +270,139 @@ export async function activate(context: vscode.ExtensionContext) {
                      res.writeHead(500);
                      res.end(`Internal Error: ${e.message}`);
                 }
-            } else if (req.url === '/installSqlCop' && req.method === 'POST') {
+            } else if ((url === '/runTest' || url === '/runTest/') && method === 'POST') {
+                outputChannel.appendLine('Match: /runTest');
+                outputChannel.appendLine('MCP requested specific test execution.');
+                try {
+                    const { testName } = JSON.parse(body);
+                    if (!testName) {
+                        res.writeHead(400);
+                        res.end('Missing parameter: testName');
+                        return;
+                    }
+
+                    // Find an open SQL document to serve as the connection context
+                    let editorUri = vscode.window.activeTextEditor?.document.uri.toString();
+                    if (!editorUri || !editorUri.endsWith('.sql')) {
+                        const sqlDoc = vscode.workspace.textDocuments.find(d => d.languageId === 'sql');
+                        if (sqlDoc) {
+                            editorUri = sqlDoc.uri.toString();
+                        }
+                    }
+
+                    if (!editorUri) {
+                        res.writeHead(400);
+                        res.end('No active SQL connection detected. Please ensure a connected .sql file is open.');
+                        return;
+                    }
+
+                    res.writeHead(200, { 'Content-Type': 'text/plain' });
+                    
+                    try {
+                        let activeDb = '(unknown)';
+                        try {
+                            activeDb = mssqlApi.connectionSharing.getActiveDatabase(editorUri) || activeDb;
+                        } catch (e) {
+                            outputChannel.appendLine(`Could not get active database name: ${e}`);
+                        }
+
+                        // Run the specific test
+                        const query = `EXEC tSQLt.Run '${testName}';`;
+                        let executionError = '';
+                        try {
+                            await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, query);
+                        } catch (err: any) {
+                            executionError = err.message || String(err);
+                            outputChannel.appendLine(`tSQLt.Run reported status: ${executionError}`);
+                        }
+
+                        // Fetch detailed results (it will only contain results for the test we just ran if tSQLt is fresh, 
+                        // but usually it clears on each Run call in most tSQLt setups, or we can filter)
+                        let passedCnt = 0;
+                        let failedCnt = 0;
+                        let errorsCnt = 0;
+                        let passedList = '';
+                        let failedList = '';
+                        let errorsList = '';
+                        let resultsFound = false;
+
+                        try {
+                            // We filter by the test case we just ran to be precise
+                            const detailedResultsQuery = `
+                                SELECT 
+                                    CAST(Class AS NVARCHAR(MAX)) AS Class, 
+                                    CAST(TestCase AS NVARCHAR(MAX)) AS TestCase, 
+                                    CAST(Result AS NVARCHAR(MAX)) AS Result, 
+                                    CAST(Msg AS NVARCHAR(MAX)) AS Msg
+                                FROM tSQLt.TestResult
+                                WHERE '[' + CAST(Class AS NVARCHAR(MAX)) + '].[' + CAST(TestCase AS NVARCHAR(MAX)) + ']' = '${testName}'
+                                   OR CAST(Class AS NVARCHAR(MAX)) + '.' + CAST(TestCase AS NVARCHAR(MAX)) = '${testName}';
+                            `;
+                            const detailsResult = await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, detailedResultsQuery);
+                            
+                            if (detailsResult && detailsResult.rows && detailsResult.rows.length > 0) {
+                                resultsFound = true;
+                                for (const row of detailsResult.rows) {
+                                    const className = row[0].displayValue || row[0];
+                                    const testNameRow = row[1].displayValue || row[1];
+                                    const resultStatus = (row[2].displayValue || row[2] || '').toLowerCase();
+                                    const message = row[3].displayValue || row[3] || '';
+                                    
+                                    const testFullName = `[${className}].[${testNameRow}]`;
+                                    
+                                    if (resultStatus.includes('success')) {
+                                        passedCnt++;
+                                        passedList += `✅ ${testFullName}\\n`;
+                                    } else if (resultStatus.includes('failure')) {
+                                        failedCnt++;
+                                        failedList += `❌ ${testFullName}: FAILURE\\n`;
+                                        if (message) {
+                                            const cleanMsg = message.replace(/\\n/g, '\\n    ');
+                                            failedList += `    Reason: ${cleanMsg}\\n`;
+                                        }
+                                    } else if (resultStatus.includes('error')) {
+                                        errorsCnt++;
+                                        errorsList += `⚠️ ${testFullName}: ERROR\\n`;
+                                        if (message) {
+                                            const cleanMsg = message.replace(/\\n/g, '\\n    ');
+                                            errorsList += `    Reason: ${cleanMsg}\\n`;
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            outputChannel.appendLine(`Secondary error fetching tSQLt.TestResult: ${e}`);
+                        }
+
+                        let summary = `SQL Rely Test Execution Summary for [${activeDb}]:\\n`;
+                        if (resultsFound) {
+                            if (passedCnt > 0) summary += `✅ Test [${testName}] PASSED.\\n\\n`;
+                            if (failedCnt > 0) summary += `❌ Test [${testName}] FAILED.\\n\\n${failedList}`;
+                            if (errorsCnt > 0) summary += `⚠️ Test [${testName}] ERRORED.\\n\\n${errorsList}`;
+                        } else {
+                            if (executionError) {
+                                summary += `⚠️ Test Execution reported an error/failure summary:\\n${executionError}\\n`;
+                            } else {
+                                summary += `(No test results found for [${testName}] in tSQLt.TestResult table.)\\n`;
+                            }
+                        }
+                        
+                        summary += `\\n(For interactive debugging, use the VS Code Test Explorer sidebar.)`;
+                        res.end(summary);
+
+                    } catch(err: any) {
+                        res.end(`Critical Failure during MCP /runTest Handler: ${err.message}`);
+                    }
+                } catch(e: any) {
+                    res.writeHead(500);
+                    res.end(`Internal Error parsing /runTest body: ${e.message}`);
+                }
+
+            } else if ((url === '/installSqlCop' || url === '/installSqlCop/') && method === 'POST') {
                 vscode.commands.executeCommand('sql-rely.installSqlCop');
                 res.writeHead(200);
                 res.end('Install SQLCop command triggered in VS Code.');
-            } else if (req.url === '/createTest' && req.method === 'POST') {
+            } else if ((url === '/createTest' || url === '/createTest/') && method === 'POST') {
                 const template = "CREATE PROCEDURE [tSQLt].[test_MyNewTest]\\nAS\\nBEGIN\\n\\t-- Arrange\\n\\t-- Act\\n\\t-- Assert\\n\\tEXEC tSQLt.Fail 'Test not implemented';\\nEND";
                 res.writeHead(200, { 'Content-Type': 'text/plain' });
                 res.end(template);
