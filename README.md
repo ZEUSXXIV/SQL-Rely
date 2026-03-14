@@ -14,6 +14,38 @@ SQL Rely leverages the official `vscode-mssql` extension to connect to your data
 *   **Test Scaffolding (`SQL Rely: Create New Test`)**: Prompts for a Schema and Name, then scaffolds a `CREATE OR ALTER PROCEDURE` template.
 *   **Native Edit Support**: Right-click any test in the Test Explorer and select **`Edit Test`** to query its definition and open it natively in a new editor tab for rapid modifications.
 *   **Direct Execution**: Click the "Play" button on any test or group to execute them. Uses the `tSQLt.Run` handler to display inline pass/fail results directly in the code!
+*   **Execution (`runHandler` function)**: Change the mocked `WAITFOR DELAY` query string to actually construct and execute the test runner string (e.g., `EXEC tSQLt.Run '${test.id}';`), capturing the true outcome based on the result set returned by `executeSimpleQuery()`.
+
+## GitHub Copilot MCP Integration
+
+SQL Rely includes a built-in Model Context Protocol (MCP) server that allows GitHub Copilot Chat in VS Code to interact with your databases directly. Copilot can create SQL test templates, run your test suite, and automatically install SQLCop scripts using your active database connection.
+
+### How to Configure
+
+1. Ensure the `sql-rely` workspace is compiling correctly (`npm run compile`) so that `out/mcp-server.js` exists.
+2. Ensure you have the Extension Development Host running your extension (or install it properly) and an active SQL database connection open.
+3. Open your overarching VS Code User Settings (JSON) by running the command `Preferences: Open User Settings (JSON)`.
+4. Register the stdio MCP server in your `settings.json`:
+
+```json
+{
+  "github.copilot.chat.mcp.enabled": true,
+  "github.copilot.mcp.servers": {
+    "sql-rely-mcp": {
+      "command": "node",
+      "args": [
+        "c:/Users/Naveen/Documents/projects/sql-rely/out/mcp-server.js"
+      ]
+    }
+  }
+}
+```
+
+5. Reload VS Code (or click "Relaunch MCP Servers" in the MCP panel).
+6. In GitHub Copilot Chat, you can now invoke it by asking:
+   - *"Run my SQL Rely database tests."*
+   - *"Install SQLCop tools to my database via SQL Rely."*
+   - *"Create a new tSQLt test case."*
 
 ## Documentation
 

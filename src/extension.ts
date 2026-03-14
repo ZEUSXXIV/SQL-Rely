@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import { IExtension } from './mssql';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as http from 'http';
+import * as os from 'os';
 
 let outputChannel: vscode.OutputChannel;
 
@@ -77,6 +79,162 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     }));
     
+    // Start local HTTP server for MCP
+    const server = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+            if (req.url === '/runTests' && req.method === 'POST') {
+                outputChannel.appendLine('MCP requested test execution. Running...');
+                try {
+                    // Find an open SQL document to serve as the connection context
+                    let editorUri = vscode.window.activeTextEditor?.document.uri.toString();
+                    if (!editorUri || !editorUri.endsWith('.sql')) {
+                        const sqlDoc = vscode.workspace.textDocuments.find(d => d.languageId === 'sql');
+                        if (sqlDoc) {
+                            editorUri = sqlDoc.uri.toString();
+                        }
+                    }
+
+                    if (!editorUri) {
+                        res.writeHead(400);
+                        res.end('No active SQL connection detected to run tests. Please ensure a connected .sql file is open in the background.');
+                        return;
+                    }
+
+                    // Directly execute tSQLt.RunAll
+                    const query = `EXEC tSQLt.RunAll;`;
+                    res.writeHead(200, { 'Content-Type': 'text/plain' });
+                    
+                    try {
+                        let activeDb = '(unknown)';
+                        try {
+                            activeDb = mssqlApi.connectionSharing.getActiveDatabase(editorUri) || activeDb;
+                        } catch (e) {
+                            outputChannel.appendLine(`Could not get active database name: ${e}`);
+                        }
+
+                        // Step 1: Detect all schemas that contain procedures starting with 'test'
+                        const discoveryQuery = `
+                            SELECT DISTINCT s.name 
+                            FROM sys.procedures p 
+                            INNER JOIN sys.schemas s ON p.schema_id = s.schema_id 
+                            WHERE p.name LIKE 'test%';
+                        `;
+                        const discoveryResult = await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, discoveryQuery);
+                        
+                        if (!discoveryResult || !discoveryResult.rows || discoveryResult.rows.length === 0) {
+                            res.end(`No test procedures (starting with 'test%') were found in database: [${activeDb}].`);
+                            return;
+                        }
+
+                        // Step 2: Check if tSQLt is installed
+                        const tsqltCheckQuery = `SELECT OBJECT_ID('tSQLt.RunAll') AS RunAllId, OBJECT_ID('tSQLt.NewTestClass') AS NewTestClassId;`;
+                        const tsqltCheck = await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, tsqltCheckQuery);
+                        const hasRunAll = tsqltCheck && tsqltCheck.rows && tsqltCheck.rows[0][0] !== null;
+
+                        if (!hasRunAll) {
+                            res.end(`Detected ${discoveryResult.rows.length} test schemas, but the tSQLt framework does not appear to be installed in [${activeDb}]. Please run 'Install tSQLt Framework' first.`);
+                            return;
+                        }
+
+                        // Step 3: Auto-register schemas as test classes if they aren't already
+                        // Step 3a: Detection of existing non-test-class schemas
+                        for (const row of discoveryResult.rows) {
+                            const schemaName = row[0].displayValue || row[0];
+                            const promotionQuery = `
+                                IF NOT EXISTS (
+                                    SELECT 1 FROM sys.extended_properties 
+                                    WHERE class_desc = 'SCHEMA' 
+                                      AND major_id = SCHEMA_ID('${schemaName}') 
+                                      AND name = 'tSQLt.TestClass'
+                                )
+                                BEGIN
+                                    -- Schema exists but is not marked as a test class.
+                                    -- Promotion: Add the extended property manually to avoid tSQLt.NewTestClass conflict.
+                                    -- This is safer than NewTestClass if the schema already contains procedures.
+                                    EXEC sp_addextendedproperty 
+                                        @name = N'tSQLt.TestClass', 
+                                        @value = 1, 
+                                        @level0type = N'SCHEMA', 
+                                        @level0name = '${schemaName}';
+                                END
+                            `;
+                            try {
+                                await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, promotionQuery);
+                                outputChannel.appendLine(`Safe promotion: Registered [${schemaName}] as tSQLt Test Class.`);
+                            } catch (e: any) {
+                                outputChannel.appendLine(`Warning during schema promotion for [${schemaName}]: ${e.message}`);
+                            }
+                        }
+
+                        // Step 4: Run the tests!
+                        const result = await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, query);
+                        
+                        // Parse the result set for tSQLt results 
+                        let passed = 0;
+                        let failed = 0;
+                        let errors = 0;
+                        
+                        if (result && result.rows) {
+                            for (const row of result.rows) {
+                                const rowString = JSON.stringify(row).toLowerCase();
+                                if (rowString.includes('success')) passed++;
+                                else if (rowString.includes('failure')) failed++;
+                                else if (rowString.includes('error')) errors++;
+                            }
+                        }
+                        
+                        let summary = `SQL Rely Test Execution Summary for [${activeDb}]:\\n`;
+                        summary += `✅ Passed: ${passed}\\n`;
+                        summary += `❌ Failed: ${failed}\\n`;
+                        if (errors > 0) summary += `⚠️ Errors: ${errors}\\n`;
+                        
+                        if (passed === 0 && failed === 0 && errors === 0) {
+                            summary += `\\n(Note: Tests were executed but no success/failure counts could be parsed. Check the SQL Rely output channel for details.)`;
+                        } else {
+                            summary += `\\n(Note: You can view detailed failure messages directly in the VS Code Test Explorer sidebar!)`;
+                        }
+
+                        res.end(summary);
+
+                        // Also trigger the UI so the user sees the visual update in the sidebar immediately!
+                        vscode.commands.executeCommand('testing.runAll');
+
+                    } catch(err: any) {
+                        res.end(`Database Test Execution Failed: ${err.message}`);
+                    }
+
+                } catch(e: any) {
+                     res.writeHead(500);
+                     res.end(`Internal Error: ${e.message}`);
+                }
+            } else if (req.url === '/installSqlCop' && req.method === 'POST') {
+                vscode.commands.executeCommand('sql-rely.installSqlCop');
+                res.writeHead(200);
+                res.end('Install SQLCop command triggered in VS Code.');
+            } else if (req.url === '/createTest' && req.method === 'POST') {
+                const template = "CREATE PROCEDURE [tSQLt].[test_MyNewTest]\\nAS\\nBEGIN\\n\\t-- Arrange\\n\\t-- Act\\n\\t-- Assert\\n\\tEXEC tSQLt.Fail 'Test not implemented';\\nEND";
+                res.writeHead(200, { 'Content-Type': 'text/plain' });
+                res.end(template);
+            } else {
+                res.writeHead(404);
+                res.end('Not found');
+            }
+        });
+    });
+
+    server.listen(0, '127.0.0.1', () => {
+        const address = server.address();
+        if (address && typeof address !== 'string') {
+            const portFile = path.join(os.tmpdir(), '.sql-rely.port');
+            fs.writeFileSync(portFile, address.port.toString());
+            outputChannel.appendLine(`MCP backend listening on port ${address.port} (saved to ${portFile})`);
+        }
+    });
+
+    context.subscriptions.push({ dispose: () => server.close() });
+
     outputChannel.appendLine('Activation complete.');
 }
 
@@ -117,14 +275,35 @@ async function installSqlCopTests(api: any, context: vscode.ExtensionContext) {
             return;
         }
 
-        // Create schema first
+        // Create schema first (using NewTestClass if tSQLt is present)
         const createSchemaQuery = `
             IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'SQLCop')
             BEGIN
-                EXEC('CREATE SCHEMA [SQLCop]');
+                IF OBJECT_ID('tSQLt.NewTestClass') IS NOT NULL
+                BEGIN
+                    EXEC tSQLt.NewTestClass 'SQLCop';
+                END
+                ELSE
+                BEGIN
+                    EXEC('CREATE SCHEMA [SQLCop]');
+                END
+            END
+            ELSE IF OBJECT_ID('tSQLt.NewTestClass') IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM sys.extended_properties 
+                 WHERE class_desc = 'SCHEMA' 
+                   AND major_id = SCHEMA_ID('SQLCop') 
+                   AND name = 'tSQLt.TestClass'
+            )
+            BEGIN
+                -- Promote existing non-test SQLCop schema
+                EXEC sp_addextendedproperty 
+                    @name = N'tSQLt.TestClass', 
+                    @value = 1, 
+                    @level0type = N'SCHEMA', 
+                    @level0name = 'SQLCop';
             END
         `;
-        outputChannel.appendLine('Creating SQLCop schema if not exists...');
+        outputChannel.appendLine('Ensuring SQLCop test class/schema exists...');
         await api.connectionSharing.executeSimpleQuery(editorUri, createSchemaQuery);
 
         await vscode.window.withProgress({
