@@ -169,32 +169,89 @@ export async function activate(context: vscode.ExtensionContext) {
                         }
 
                         // Step 4: Run the tests!
-                        const result = await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, query);
+                        let executionError = '';
+                        try {
+                            await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, query);
+                        } catch (err: any) {
+                            // tSQLt.RunAll throws a RAISERROR 50000 if tests fail.
+                            // We catch this so we can still proceed to Step 5 and fetch the details!
+                            executionError = err.message || String(err);
+                            outputChannel.appendLine(`tSQLt.RunAll reported status: ${executionError}`);
+                        }
                         
-                        // Parse the result set for tSQLt results 
-                        let passed = 0;
-                        let failed = 0;
-                        let errors = 0;
-                        
-                        if (result && result.rows) {
-                            for (const row of result.rows) {
-                                const rowString = JSON.stringify(row).toLowerCase();
-                                if (rowString.includes('success')) passed++;
-                                else if (rowString.includes('failure')) failed++;
-                                else if (rowString.includes('error')) errors++;
+                        // Step 5: Fetch detailed results from tSQLt.TestResult table
+                        let passedCnt = 0;
+                        let failedCnt = 0;
+                        let errorsCnt = 0;
+                        let passedList = '';
+                        let failedList = '';
+                        let errorsList = '';
+                        let resultsFound = false;
+
+                        try {
+                            const detailedResultsQuery = `
+                                SELECT 
+                                    CAST(Class AS NVARCHAR(MAX)) AS Class, 
+                                    CAST(TestCase AS NVARCHAR(MAX)) AS TestCase, 
+                                    CAST(Result AS NVARCHAR(MAX)) AS Result, 
+                                    CAST(Msg AS NVARCHAR(MAX)) AS Msg
+                                FROM tSQLt.TestResult;
+                            `;
+                            const detailsResult = await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, detailedResultsQuery);
+                            
+                            if (detailsResult && detailsResult.rows && detailsResult.rows.length > 0) {
+                                resultsFound = true;
+                                for (const row of detailsResult.rows) {
+                                    const className = row[0].displayValue || row[0];
+                                    const testName = row[1].displayValue || row[1];
+                                    const resultStatus = (row[2].displayValue || row[2] || '').toLowerCase();
+                                    const message = row[3].displayValue || row[3] || '';
+                                    
+                                    const testFullName = `[${className}].[${testName}]`;
+                                    
+                                    if (resultStatus.includes('success')) {
+                                        passedCnt++;
+                                        passedList += `✅ ${testFullName}\\n`;
+                                    } else if (resultStatus.includes('failure')) {
+                                        failedCnt++;
+                                        failedList += `❌ ${testFullName}: FAILURE\\n`;
+                                        if (message) {
+                                            const cleanMsg = message.replace(/\\n/g, '\\n    ');
+                                            failedList += `    Reason: ${cleanMsg}\\n`;
+                                        }
+                                    } else if (resultStatus.includes('error')) {
+                                        errorsCnt++;
+                                        errorsList += `⚠️ ${testFullName}: ERROR\\n`;
+                                        if (message) {
+                                            const cleanMsg = message.replace(/\\n/g, '\\n    ');
+                                            errorsList += `    Reason: ${cleanMsg}\\n`;
+                                        }
+                                    }
+                                }
                             }
+                        } catch (e) {
+                            outputChannel.appendLine(`Secondary error fetching tSQLt.TestResult: ${e}`);
                         }
                         
                         let summary = `SQL Rely Test Execution Summary for [${activeDb}]:\\n`;
-                        summary += `✅ Passed: ${passed}\\n`;
-                        summary += `❌ Failed: ${failed}\\n`;
-                        if (errors > 0) summary += `⚠️ Errors: ${errors}\\n`;
                         
-                        if (passed === 0 && failed === 0 && errors === 0) {
-                            summary += `\\n(Note: Tests were executed but no success/failure counts could be parsed. Check the SQL Rely output channel for details.)`;
+                        if (resultsFound) {
+                            summary += `✅ Passed: ${passedCnt} | ❌ Failed: ${failedCnt}${errorsCnt > 0 ? ` | ⚠️ Errors: ${errorsCnt}` : ''}\\n\\n`;
+                            
+                            if (failedList) summary += `❌ FAILED TESTS:\\n${failedList}\\n`;
+                            if (errorsList) summary += `⚠️ ERRORED TESTS:\\n${errorsList}\\n`;
+                            if (passedList) summary += `✅ PASSED TESTS:\\n${passedList}\\n`;
                         } else {
-                            summary += `\\n(Note: You can view detailed failure messages directly in the VS Code Test Explorer sidebar!)`;
+                            // Fallback: If no results in table, use the execution error if it exists
+                            if (executionError) {
+                                summary += `⚠️ Test Execution reported an error/failure summary:\\n${executionError}\\n`;
+                                summary += `\\n(Note: Detailed test names could not be retrieved from tSQLt.TestResult table.)\\n`;
+                            } else {
+                                summary += `(No test results found in tSQLt.TestResult table and no execution error was reported.)\\n`;
+                            }
                         }
+                        
+                        summary += `\\n(For interactive debugging, use the VS Code Test Explorer sidebar.)`;
 
                         res.end(summary);
 
@@ -202,7 +259,7 @@ export async function activate(context: vscode.ExtensionContext) {
                         vscode.commands.executeCommand('testing.runAll');
 
                     } catch(err: any) {
-                        res.end(`Database Test Execution Failed: ${err.message}`);
+                        res.end(`Critical Failure during MCP Test Handler: ${err.message}`);
                     }
 
                 } catch(e: any) {
