@@ -66,16 +66,62 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "install_sqlcop",
-        description: "Install SQLCop tests into the current database via SQL Rely",
+        name: "list_sql_tests",
+        description: "List all existing tSQLt test classes and their test cases",
         inputSchema: {
           type: "object",
           properties: {},
         },
       },
       {
+        name: "create_test_class",
+        description: "Create a new tSQLt test class (schema)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            className: {
+              type: "string",
+              description: "The name of the test class to create"
+            }
+          },
+          required: ["className"]
+        },
+      },
+      {
         name: "create_sql_test",
         description: "Generate a template for a new tSQLt test",
+        inputSchema: {
+          type: "object",
+          properties: {
+            className: {
+              type: "string",
+              description: "The name of the test class (schema)"
+            },
+            testName: {
+              type: "string",
+              description: "The name of the test (procedure), should start with 'test'"
+            }
+          },
+          required: ["className", "testName"]
+        },
+      },
+      {
+        name: "deploy_sql_test",
+        description: "Deploy/Create a tSQLt test procedure in the database",
+        inputSchema: {
+          type: "object",
+          properties: {
+            sqlCode: {
+              type: "string",
+              description: "The full T-SQL code (CREATE PROCEDURE ...) for the test"
+            }
+          },
+          required: ["sqlCode"]
+        },
+      },
+      {
+        name: "install_sqlcop",
+        description: "Install SQLCop tests into the current database via SQL Rely",
         inputSchema: {
           type: "object",
           properties: {},
@@ -95,17 +141,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { testName } = request.params.arguments as { testName: string };
         const response = await axios.post(`${getBaseUrl()}/runTest`, { testName });
         return { content: [{ type: "text", text: response.data }] };
-      } else if (name === "install_sqlcop") {
-        const response = await axios.post(`${getBaseUrl()}/installSqlCop`);
+      } else if (name === "list_sql_tests") {
+        const response = await axios.post(`${getBaseUrl()}/listTests`);
+        return { content: [{ type: "text", text: response.data }] };
+      } else if (name === "create_test_class") {
+        const { className } = request.params.arguments as { className: string };
+        const response = await axios.post(`${getBaseUrl()}/createTestClass`, { className });
         return { content: [{ type: "text", text: response.data }] };
       } else if (name === "create_sql_test") {
-        const response = await axios.post(`${getBaseUrl()}/createTest`);
+        const { className, testName } = request.params.arguments as { className: string, testName: string };
+        const response = await axios.post(`${getBaseUrl()}/createTestTemplate`, { className, testName });
+        return { content: [{ type: "text", text: response.data }] };
+      } else if (name === "deploy_sql_test") {
+        const { sqlCode } = request.params.arguments as { sqlCode: string };
+        const response = await axios.post(`${getBaseUrl()}/deployTest`, { sqlCode });
+        return { content: [{ type: "text", text: response.data }] };
+      } else if (name === "install_sqlcop") {
+        const response = await axios.post(`${getBaseUrl()}/installSqlCop`);
         return { content: [{ type: "text", text: response.data }] };
       }
       throw new Error(`Tool not found: ${name}`);
   } catch (err: any) {
+      const errorDetail = err.response?.data || err.message;
       return {
-          content: [{ type: "text", text: `Error calling tool ${name}: ${err.message}. Make sure SQL Rely is activated in VS Code (open a SQL file).` }],
+          content: [{ type: "text", text: `Error calling tool ${name}: ${errorDetail}. Make sure SQL Rely is activated in VS Code (open a SQL file).` }],
           isError: true
       };
   }

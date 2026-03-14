@@ -398,6 +398,119 @@ export async function activate(context: vscode.ExtensionContext) {
                     res.end(`Internal Error parsing /runTest body: ${e.message}`);
                 }
 
+            } else if ((url === '/listTests' || url === '/listTests/') && method === 'POST') {
+                outputChannel.appendLine('MCP requested test list.');
+                try {
+                    let editorUri = vscode.window.activeTextEditor?.document.uri.toString();
+                    if (!editorUri || !editorUri.endsWith('.sql')) {
+                        const sqlDoc = vscode.workspace.textDocuments.find(d => d.languageId === 'sql');
+                        if (sqlDoc) editorUri = sqlDoc.uri.toString();
+                    }
+
+                    if (!editorUri) {
+                        res.writeHead(400);
+                        res.end('No active SQL connection.');
+                        return;
+                    }
+
+                    const query = `
+                        SELECT 
+                            s.name AS ClassName,
+                            p.name AS TestName
+                        FROM sys.procedures p
+                        JOIN sys.schemas s ON p.schema_id = s.schema_id
+                        JOIN sys.extended_properties ep ON s.schema_id = ep.major_id
+                        WHERE ep.name = 'tSQLt.TestClass'
+                          AND p.name LIKE 'test%'
+                        ORDER BY ClassName, TestName;
+                    `;
+                    const result = await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, query);
+                    let response = 'Existing tSQLt Tests:\\n';
+                    if (result && result.rows && result.rows.length > 0) {
+                        let currentClass = '';
+                        for (const row of result.rows) {
+                            const className = row[0].displayValue || row[0];
+                            const testName = row[1].displayValue || row[1];
+                            if (className !== currentClass) {
+                                currentClass = className;
+                                response += `\\nClass: [${className}]\\n`;
+                            }
+                            response += `  - [${testName}]\\n`;
+                        }
+                    } else {
+                        response += '(No tests found.)';
+                    }
+                    res.writeHead(200, { 'Content-Type': 'text/plain' });
+                    res.end(response);
+                } catch (e: any) {
+                    res.writeHead(500);
+                    res.end(`Error listing tests: ${e.message}`);
+                }
+
+            } else if ((url === '/createTestClass' || url === '/createTestClass/') && method === 'POST') {
+                outputChannel.appendLine('MCP requested new test class.');
+                try {
+                    const { className } = JSON.parse(body);
+                    let editorUri = vscode.window.activeTextEditor?.document.uri.toString();
+                    if (!editorUri || !editorUri.endsWith('.sql')) {
+                        const sqlDoc = vscode.workspace.textDocuments.find(d => d.languageId === 'sql');
+                        if (sqlDoc) editorUri = sqlDoc.uri.toString();
+                    }
+
+                    if (!editorUri || !className) {
+                        res.writeHead(400);
+                        res.end('Missing connection or className.');
+                        return;
+                    }
+
+                    const query = `EXEC tSQLt.NewTestClass '${className}';`;
+                    await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, query);
+                    res.writeHead(200);
+                    res.end(`Test class [${className}] created successfully.`);
+                } catch (e: any) {
+                    res.writeHead(500);
+                    res.end(`Error creating test class: ${e.message}`);
+                }
+
+            } else if ((url === '/createTestTemplate' || url === '/createTestTemplate/') && method === 'POST') {
+                try {
+                    const { className, testName } = JSON.parse(body);
+                    const template = `CREATE PROCEDURE [${className}].[${testName}]\\nAS\\nBEGIN\\n    -- Arrange\\n\\n    -- Act\\n\\n    -- Assert\\n    EXEC tSQLt.Fail 'Test not implemented';\\nEND`;
+                    res.writeHead(200, { 'Content-Type': 'text/plain' });
+                    res.end(template);
+                } catch (e: any) {
+                    res.writeHead(500);
+                    res.end(`Error generating template: ${e.message}`);
+                }
+
+            } else if ((url === '/deployTest' || url === '/deployTest/') && method === 'POST') {
+                outputChannel.appendLine('MCP requested test deployment.');
+                try {
+                    const { sqlCode } = JSON.parse(body);
+                    let editorUri = vscode.window.activeTextEditor?.document.uri.toString();
+                    if (!editorUri || !editorUri.endsWith('.sql')) {
+                        const sqlDoc = vscode.workspace.textDocuments.find(d => d.languageId === 'sql');
+                        if (sqlDoc) editorUri = sqlDoc.uri.toString();
+                    }
+
+                    if (!editorUri || !sqlCode) {
+                        res.writeHead(400);
+                        res.end('Missing connection or sqlCode.');
+                        return;
+                    }
+
+                    outputChannel.appendLine(`Deploying SQL to [${editorUri}]:\\n${sqlCode}`);
+                    await mssqlApi.connectionSharing.executeSimpleQuery(editorUri, sqlCode);
+                    res.writeHead(200);
+                    res.end('Test deployed successfully.');
+                    
+                    // Trigger UI update
+                    vscode.commands.executeCommand('testing.runAll');
+                } catch (e: any) {
+                    res.writeHead(500);
+                    res.end(`Error deploying test: ${e.message}`);
+                }
+
             } else if ((url === '/installSqlCop' || url === '/installSqlCop/') && method === 'POST') {
                 vscode.commands.executeCommand('sql-rely.installSqlCop');
                 res.writeHead(200);
